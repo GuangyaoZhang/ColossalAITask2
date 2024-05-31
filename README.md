@@ -7,7 +7,7 @@
 
 ## 训练模型
 
-torchrun --nproc_per_node 2 sft.py --tp --dp --amp --gckp
+torchrun --nproc_per_node 4 sft.py --tp --dp --amp --gckp
 
 ## 训练结果
 
