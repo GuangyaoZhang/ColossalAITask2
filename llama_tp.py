@@ -9,12 +9,18 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.autograd import Function
+
+
+
+tp_group=[]
+
 class Embedding_TP(nn.Module):
 
     def __init__(self, embs):
         super().__init__()
         embs:nn.Embedding
         rank = dist.get_rank()
+        rank = dist.get_group_rank(tp_group, rank)
         vocab_size = len(embs.weight)
         per_rank_vocab = vocab_size//2
 
@@ -29,7 +35,9 @@ class Embedding_TP(nn.Module):
     
     def forward(self,input):
         input = input.clone()
-        rank = dist.get_rank()
+        # rank = dist.get_rank()
+        # rank = dist.get_group_rank(tp_group, rank)
+        rank = 0
         input-=rank*self.per_rank_vocab
         mask = (input<self.per_rank_vocab )*(input>=0 )
         
@@ -39,7 +47,28 @@ class Embedding_TP(nn.Module):
 
         emb[~mask] = 0
 
-        dist.all_reduce(emb)
+        dist.all_reduce(torch.rand(10000).cuda(),group=tp_group)
+        dist.barrier()
+
+    
+        # dist.all_reduce(torch.zeros_like(emb),group=tp_group)
+        # dist.barrier()
+
+        dist.all_reduce(torch.ones_like(emb),group=tp_group)
+        dist.barrier()
+
+        dist.all_reduce(emb.clone(),group=tp_group)
+        dist.barrier()
+
+        dist.all_reduce(emb,group=tp_group)
+        # dist.all_reduce(emb)
+
+        dist.barrier()
+        # import time
+        # time.sleep(1)
+        # exit(0)
+
+
 
 
         return emb
@@ -52,7 +81,7 @@ class F(Function):
 
     @staticmethod
     def backward(ctx, gradients) :
-        dist.all_reduce(gradients)
+        dist.all_reduce(gradients,group=tp_group)
         return gradients
 
 
@@ -67,6 +96,7 @@ class TP_Linear1(nn.Module):
 
         self.linear = nn.Linear(linear.weight.size(1),self.per_rank_size,bias=linear.bias)
         rank = dist.get_rank()
+        rank = dist.get_group_rank(tp_group, rank)
         self.linear.weight = nn.Parameter(linear.weight[rank*self.per_rank_size:(rank+1)*self.per_rank_size])
         if linear.bias:
             self.linear.bias = nn.Parameter(linear.bias[rank*self.per_rank_size:(rank+1)*self.per_rank_size])
@@ -88,6 +118,7 @@ class TP_Linear2(nn.Module):
         self.linear = nn.Linear(self.per_rank_size,linear.weight.size(0),bias=linear.bias)
         
         rank = dist.get_rank()
+        rank = dist.get_group_rank(tp_group, rank)
         self.linear.weight = nn.Parameter(linear.weight[:, rank*self.per_rank_size:(rank+1)*self.per_rank_size])
         
         if linear.bias:
@@ -100,7 +131,7 @@ class TP_Linear2(nn.Module):
 
     def forward(self, input):
         output = self.linear(input)
-        dist.all_reduce(output)
+        dist.all_reduce(output,group=tp_group)
         return output
 
 
@@ -155,60 +186,65 @@ class TP_LlamaModel(LlamaModel):
 class TP_LlamaForCausalLM(LlamaForCausalLM):
 
     @staticmethod
-    def from_pretrained_tp(model_name, tp):
+    def from_pretrained_tp(model_name, tpg):
         model = TP_LlamaForCausalLM.from_pretrained(model_name)
-        if not tp:
+        # return model 
+        if tpg is None:
             return model 
-        model.model = TP_LlamaModel.from_full_model(model.model)
-        # model.lm_head = TP_Linear1.from_full_model(model.lm_head)
+        else:
+            print("TP")
+            global tp_group
+            tp_group = tpg
+            model.model = TP_LlamaModel.from_full_model(model.model)
+            # model.lm_head = TP_Linear1.from_full_model(model.lm_head)
 
 
         return model
 
 
 
-class TP_cross_entropy(nn.Module):
-    def __init__(self):
+# class TP_cross_entropy(nn.Module):
+#     def __init__(self):
        
-        super().__init__()
+#         super().__init__()
 
-        self.local_cross_entropy = nn.CrossEntropyLoss()
+#         self.local_cross_entropy = nn.CrossEntropyLoss()
 
 
-    def forward(self,logits, labels):
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
+#     def forward(self,logits, labels):
+#         shift_logits = logits[..., :-1, :].contiguous()
+#         shift_labels = labels[..., 1:].contiguous()
         
-        logits_exps = torch.exp(shift_logits)
-        logits_exp_sum_per_rank = torch.sum(logits_exps,dim=-1)
-        logits_exp_sum_per_rank = logits_exp_sum_per_rank.view(-1)
+#         logits_exps = torch.exp(shift_logits)
+#         logits_exp_sum_per_rank = torch.sum(logits_exps,dim=-1)
+#         logits_exp_sum_per_rank = logits_exp_sum_per_rank.view(-1)
 
-        dist.all_reduce(logits_exp_sum_per_rank)
+#         dist.all_reduce(logits_exp_sum_per_rank)
 
-        # logits_exp_sum_per_rank = torch.unsqueeze(logits_exp_sum_per_rank, -1)
+#         # logits_exp_sum_per_rank = torch.unsqueeze(logits_exp_sum_per_rank, -1)
 
-        # logits_exps = logits_exps/logits_exp_sum_per_rank
-
-
-        shift_labels = shift_labels-shift_logits.size(2)*dist.get_rank()
-
-        label_mask = (shift_labels>=0)*(shift_labels<shift_logits.size(2))
-        shift_labels[~label_mask]=0
+#         # logits_exps = logits_exps/logits_exp_sum_per_rank
 
 
-        label_mask = label_mask.view(-1)
-        shift_labels = shift_labels.view(-1)
-        shift_logits = shift_logits.view(-1, shift_logits.size(2))
+#         shift_labels = shift_labels-shift_logits.size(2)*dist.get_rank()
 
-        logits_arange = torch.arange(0, len(shift_labels))
+#         label_mask = (shift_labels>=0)*(shift_labels<shift_logits.size(2))
+#         shift_labels[~label_mask]=0
 
-        true_logits = shift_logits[logits_arange, shift_labels]
-        true_logits[~label_mask] = 0
+
+#         label_mask = label_mask.view(-1)
+#         shift_labels = shift_labels.view(-1)
+#         shift_logits = shift_logits.view(-1, shift_logits.size(2))
+
+#         logits_arange = torch.arange(0, len(shift_labels))
+
+#         true_logits = shift_logits[logits_arange, shift_labels]
+#         true_logits[~label_mask] = 0
         
 
 
-        dist.all_reduce(true_logits)
+#         dist.all_reduce(true_logits)
 
 
-        return torch.mean(torch.log(logits_exp_sum_per_rank)-true_logits)
+#         return torch.mean(torch.log(logits_exp_sum_per_rank)-true_logits)
 
